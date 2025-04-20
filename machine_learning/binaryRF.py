@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-panaroo_classifier.py  (v1.3.4 – robust to SHAP ≥ 0.44) - MODIFIED v5
+panaroo_classifier.py  (v1.3.4 – robust to SHAP ≥ 0.44) - MODIFIED v6 (Importance 0-100)
 ===================================================================
 CLI para clasificar aislamientos **Animal** vs **Human**
 a partir de matrices de presencia/ausencia de Panaroo.
+
+Modifications v6:
+* Scaled classifier `Importance` to 0-100 range in `gene_presence_contribution.csv`.
+* Added `Importance_0_100` column and kept original `Importance`.
 
 Modifications v5:
 * Added `--top_genes_plot` argument to `train` command.
@@ -164,8 +168,8 @@ def design_matrix(bin_df: pd.DataFrame, exclude: Sequence[str]) -> Tuple[pd.Data
         exclude_set = set(exclude); exclude_mask = meta_known["Lineage"].isin(exclude_set)
         num_excluded = exclude_mask.sum()
         if num_excluded > 0:
-             LOGGER.info("Excluding %d samples from lineages: %s", num_excluded, sorted(list(meta_known[exclude_mask]['Lineage'].unique())))
-             keep_mask = ~exclude_mask; meta_final = meta_known[keep_mask]; bin_df_final = bin_df_filtered.loc[:, keep_mask]
+            LOGGER.info("Excluding %d samples from lineages: %s", num_excluded, sorted(list(meta_known[exclude_mask]['Lineage'].unique())))
+            keep_mask = ~exclude_mask; meta_final = meta_known[keep_mask]; bin_df_final = bin_df_filtered.loc[:, keep_mask]
         else: LOGGER.info("No samples matched exclusion list: %s", exclude); meta_final = meta_known; bin_df_final = bin_df_filtered
     else: meta_final = meta_known; bin_df_final = bin_df_filtered
     if meta_final.empty: raise ValueError("No samples remaining after filtering/exclusions.")
@@ -201,7 +205,7 @@ def build_pipeline(use_lgbm: bool, n_estimators: int, max_depth: Optional[int]) 
     """Builds the scikit‑learn pipeline including feature selection and classifier."""
     if use_lgbm and HAS_LGBM:
         LOGGER.info("Using LightGBM classifier (n_estimators=%d, max_depth=%s).", n_estimators, max_depth or 'unlimited')
-        clf: Any = LGBMClassifier(random_state=RANDOM_STATE, n_jobs=-1, class_weight="balanced", n_estimators=n_estimators, max_depth=max_depth or -1)
+        clf: Any = LGBMClassifier(random_state=RANDOM_STATE, n_jobs=-1, class_weight="balanced", n_estimators=n_estimators, max_depth=max_depth or -1, importance_type='gain') # MODIFICACIÓN: specify importance_type for consistency if needed
     else:
         if use_lgbm and not HAS_LGBM: LOGGER.warning("LightGBM not installed; falling back to RandomForest.")
         LOGGER.info("Using RandomForest classifier (n_estimators=%d, max_depth=%s).", n_estimators, max_depth or 'unlimited')
@@ -279,17 +283,32 @@ def train(cfg: TrainCfg) -> None:
         selected_mask = selector.get_support(); sel_features = X.columns[selected_mask].tolist()
         LOGGER.info("%d/%d features selected by SelectFromModel.", len(sel_features), X.shape[1])
         joblib.dump(sel_features, out / "selected_features.pkl"); LOGGER.info("Selected features list saved.")
+
         if hasattr(clf_step, "feature_importances_") and sel_features:
             importances = clf_step.feature_importances_
             if len(importances) == len(sel_features):
-                imp_df = pd.DataFrame({"Gene": sel_features, "Importance": importances}).sort_values("Importance", ascending=False)
+                # MODIFICACIÓN: Crear DataFrame inicial con importancias crudas
+                imp_df = pd.DataFrame({"Gene": sel_features, "Importance": importances})
+
+                # MODIFICACIÓN: Calcular importancia máxima y escalar a 0-100
+                max_importance = imp_df["Importance"].max()
+                if max_importance > 0:
+                    imp_df["Importance_0_100"] = (imp_df["Importance"] / max_importance) * 100
+                else:
+                    imp_df["Importance_0_100"] = 0.0 # Handle case where max importance is 0
+                    LOGGER.warning("Maximum feature importance is 0. Scaled importances set to 0.")
+
+                # MODIFICACIÓN: Ordenar por la importancia original (o la escalada, ambas darían el mismo orden)
+                imp_df = imp_df.sort_values("Importance", ascending=False)
+
+                # MODIFICACIÓN: Guardar CSV con ambas columnas de importancia
                 imp_df.to_csv(out / "gene_importances_selected.csv", index=False, float_format='%.5g')
-                LOGGER.info("Feature importances saved.")
+                LOGGER.info("Feature importances (raw and scaled 0-100) saved.")
                 shap_ready = True
             else: LOGGER.warning("Importance array length mismatch.")
         else:
-             LOGGER.warning("Classifier '%s' lacks 'feature_importances_'.", type(clf_step).__name__)
-             if sel_features and isinstance(clf_step, (RandomForestClassifier, LGBMClassifier)): shap_ready = True # SHAP TreeExplainer compatible
+            LOGGER.warning("Classifier '%s' lacks 'feature_importances_'.", type(clf_step).__name__)
+            if sel_features and isinstance(clf_step, (RandomForestClassifier, LGBMClassifier)): shap_ready = True # SHAP TreeExplainer compatible
     except Exception as e: LOGGER.error("Error getting importances/selection: %s", e, exc_info=True)
 
     # --- 5. SHAP Analysis (Optional) ---
@@ -311,50 +330,89 @@ def train(cfg: TrainCfg) -> None:
             # ... (Logic to populate shap_dict based on shap_vals type - same as previous version) ...
             if isinstance(shap_vals, list):
                 if len(shap_vals) == n_classes: shap_dict = dict(zip(le.classes_, shap_vals))
-                elif n_classes == 2 and len(shap_vals) == 1: shap_dict = {le.classes_[1]: shap_vals[0]}
+                elif n_classes == 2 and len(shap_vals) == 1: shap_dict = {le.classes_[1]: shap_vals[0]} # Often case for binary RF/LGBM
+                # MODIFICACIÓN: Handle binary case where SHAP returns values only for the positive class (1)
+                elif n_classes == 2 and len(shap_vals) == 2 and np.allclose(shap_vals[0], -shap_vals[1]):
+                    LOGGER.debug("Detected symmetric SHAP values for binary case. Using values for class '%s'.", le.classes_[1])
+                    shap_dict = {le.classes_[1]: shap_vals[1]}
+                else: LOGGER.warning("SHAP list structure unexpected: length %d for %d classes.", len(shap_vals), n_classes)
+
             elif isinstance(shap_vals, np.ndarray):
                 if shap_vals.ndim == 3 and shap_vals.shape[2] == n_classes:
                     for i,c in enumerate(le.classes_): shap_dict[c] = shap_vals[:,:,i]
-                elif shap_vals.ndim == 2 and n_classes == 2: shap_dict = {le.classes_[1]: shap_vals}
+                elif shap_vals.ndim == 2 and n_classes == 2: shap_dict = {le.classes_[1]: shap_vals} # SHAP values for class 1
+                else: LOGGER.warning("SHAP ndarray structure unexpected: shape %s for %d classes.", shap_vals.shape, n_classes)
+
             elif HAS_SHAP and isinstance(shap_vals, Explanation):
-                 arr = shap_vals.values
-                 if arr.ndim == 3 and arr.shape[2] == n_classes:
+                arr = shap_vals.values
+                base = shap_vals.base_values # Could be useful later if needed
+                if arr.ndim == 3 and arr.shape[2] == n_classes: # Multi-output
                     for i,c in enumerate(le.classes_): shap_dict[c] = arr[:,:,i]
-                 elif arr.ndim == 2 and n_classes == 2: shap_dict = {le.classes_[1]: arr}
-            if not shap_dict: raise ValueError("Could not process SHAP values.")
+                elif arr.ndim == 2 and n_classes == 2: # Binary case (often returns shape (n_samples, n_features))
+                    shap_dict = {le.classes_[1]: arr} # Assume these are SHAP values for class 1
+                else: LOGGER.warning("SHAP Explanation structure unexpected: shape %s for %d classes.", arr.shape, n_classes)
+            if not shap_dict: raise ValueError("Could not process SHAP values into expected class dictionary.")
 
             # --- 5b. Calculate Gene Presence Contribution & Counts (Binary Case) ---
             if n_classes == 2:
                 LOGGER.info("Calculating gene presence contribution and counts...")
                 contribution_results = []
-                animal_cls, human_cls = le.classes_[0], le.classes_[1]
-                sv_human = None # Target SHAP values for 'Human'
-                if human_cls in shap_dict: sv_human = shap_dict[human_cls]
-                elif animal_cls in shap_dict and len(shap_dict) == 1: sv_human = shap_dict[animal_cls] * -1; LOGGER.warning("Using inverted SHAP values from '%s'.", animal_cls)
+                animal_cls, human_cls = le.classes_[0], le.classes_[1] # Assume order [Animal, Human] or [0, 1]
+                sv_human = None # Target SHAP values for 'Human' (class 1)
+
+                if human_cls in shap_dict:
+                    sv_human = shap_dict[human_cls]
+                elif animal_cls in shap_dict and len(shap_dict) == 1:
+                    # If only SHAP for class 0 is present, invert it for class 1 contribution
+                    LOGGER.warning("Only SHAP values for class '%s' found. Inverting for '%s' contribution analysis.", animal_cls, human_cls)
+                    sv_human = shap_dict[animal_cls] * -1
+                elif len(shap_dict) > 0:
+                     # Fallback if specific class names aren't found but dict isn't empty
+                     first_key = list(shap_dict.keys())[0]
+                     LOGGER.warning("Could not find SHAP for '%s' or '%s' specifically. Using values from key '%s' (assuming it corresponds to class 1).", human_cls, animal_cls, first_key)
+                     sv_human = shap_dict[first_key]
+
                 if sv_human is not None and not X_sel_df.empty and sel_features:
-                    for i, gene in enumerate(sel_features):
-                        mask = (X_sel_df.iloc[:, i] == 1); contrib = "Indet."; c_animal, c_human = 0, 0
-                        if mask.sum() > 0:
-                            mean_shap = np.mean(sv_human[mask, i])
-                            if mean_shap > 1e-6: contrib = f"Favors_{human_cls}"
-                            elif mean_shap < -1e-6: contrib = f"Favors_{animal_cls}"
-                            else: contrib = "Neutral"
-                            counts = y.loc[X_sel_df.index[mask]].value_counts()
-                            c_animal = counts.get(animal_cls, 0); c_human = counts.get(human_cls, 0)
-                        else: contrib = "NotObsPres"
-                        contribution_results.append({"Gene": gene, "Contrib": contrib, f"N_{animal_cls}": c_animal, f"N_{human_cls}": c_human})
-                    if contribution_results:
-                        contrib_df = pd.DataFrame(contribution_results)
-                        col_order = ['Gene', f"N_{animal_cls}", f"N_{human_cls}", 'Contrib']
-                        if not imp_df.empty and 'Gene' in imp_df.columns and 'Importance' in imp_df.columns:
-                            contrib_df=pd.merge(contrib_df, imp_df[['Gene','Importance']], on='Gene', how='left').sort_values('Importance', ascending=False)
-                            col_order.insert(1, 'Importance') # Add Importance column
-                        final_cols = [c for c in col_order if c in contrib_df.columns] + [c for c in contrib_df.columns if c not in col_order]
-                        contrib_df = contrib_df[final_cols]
-                        contrib_file = out / "gene_presence_contribution.csv"
-                        contrib_df.to_csv(contrib_file, index=False, float_format='%.5g')
-                        LOGGER.info("✔ Gene contribution file saved: %s", contrib_file)
-                else: LOGGER.warning("Cannot calculate contributions (missing SHAP/data).")
+                    if sv_human.shape != X_sel_df.shape:
+                         LOGGER.error(f"SHAP values shape {sv_human.shape} mismatch with selected data shape {X_sel_df.shape}.")
+                    else:
+                        for i, gene in enumerate(sel_features):
+                            mask = (X_sel_df.iloc[:, i] == 1); contrib = "Indet."; c_animal, c_human = 0, 0
+                            if mask.sum() > 0:
+                                mean_shap = np.mean(sv_human[mask, i])
+                                if mean_shap > 1e-6: contrib = f"Favors_{human_cls}"
+                                elif mean_shap < -1e-6: contrib = f"Favors_{animal_cls}"
+                                else: contrib = "Neutral"
+                                counts = y.loc[X_sel_df.index[mask]].value_counts()
+                                c_animal = counts.get(animal_cls, 0); c_human = counts.get(human_cls, 0)
+                            else: contrib = "NotObsPres"
+                            contribution_results.append({"Gene": gene, "Contrib": contrib, f"N_{animal_cls}": c_animal, f"N_{human_cls}": c_human})
+
+                        if contribution_results:
+                            contrib_df = pd.DataFrame(contribution_results)
+                            # MODIFICACIÓN: Definir el orden deseado de columnas, incluyendo la escalada
+                            col_order = ['Gene', 'Importance', 'Importance_0_100', f"N_{animal_cls}", f"N_{human_cls}", 'Contrib']
+
+                            if not imp_df.empty and 'Gene' in imp_df.columns and 'Importance' in imp_df.columns and 'Importance_0_100' in imp_df.columns:
+                                # MODIFICACIÓN: Hacer merge con imp_df para obtener ambas columnas de importancia
+                                contrib_df=pd.merge(contrib_df, imp_df[['Gene','Importance', 'Importance_0_100']], on='Gene', how='left')
+                                # MODIFICACIÓN: Ordenar por la importancia original (o escalada)
+                                contrib_df = contrib_df.sort_values('Importance', ascending=False)
+                            else:
+                                # MODIFICACIÓN: Si imp_df está vacío o faltan columnas, añadir columnas vacías para mantener la estructura
+                                if 'Importance' not in contrib_df.columns: contrib_df['Importance'] = np.nan
+                                if 'Importance_0_100' not in contrib_df.columns: contrib_df['Importance_0_100'] = np.nan
+
+                            # Reordenar y asegurar que todas las columnas esperadas estén presentes
+                            final_cols = [c for c in col_order if c in contrib_df.columns] + [c for c in contrib_df.columns if c not in col_order]
+                            contrib_df = contrib_df[final_cols]
+
+                            contrib_file = out / "gene_presence_contribution.csv"
+                            # MODIFICACIÓN: Asegurar formato correcto para ambas importancias
+                            contrib_df.to_csv(contrib_file, index=False, float_format='%.5g')
+                            LOGGER.info("✔ Gene contribution file (with scaled importance 0-100) saved: %s", contrib_file) # MODIFICACIÓN: Mensaje actualizado
+                        else: LOGGER.warning("Contribution results list is empty.")
+                else: LOGGER.warning("Cannot calculate contributions (missing suitable SHAP values/data).")
             else: LOGGER.info("Contribution analysis skipped (not binary).")
 
             # --- 5c. Save SHAP Importance CSVs and Plots ---
@@ -362,44 +420,54 @@ def train(cfg: TrainCfg) -> None:
             gene_to_index = {gene: idx for idx, gene in enumerate(sel_features)} # For subsetting
 
             for cls_name, sv_array in shap_dict.items():
-                 if sv_array.ndim != 2 or sv_array.shape[1] != len(sel_features):
-                     LOGGER.error("SHAP array '%s' invalid shape %s.", cls_name, sv_array.shape); continue
-                 mean_abs_shap = np.mean(np.abs(sv_array), axis=0)
-                 mean_shap = np.mean(sv_array, axis=0) # Mean SHAP value per feature
-                 shap_imp_df = pd.DataFrame({"Gene": sel_features, f"MeanAbsSHAP_{cls_name}": mean_abs_shap, f"MeanSHAP_{cls_name}": mean_shap})
-                 shap_imp_df = shap_imp_df.sort_values(f"MeanAbsSHAP_{cls_name}", ascending=False)
-                 shap_imp_df.to_csv(out / f"shap_importance_{cls_name}.csv", index=False, float_format='%.5g')
+                    if sv_array.ndim != 2 or sv_array.shape[1] != len(sel_features):
+                           LOGGER.error("SHAP array '%s' invalid shape %s.", cls_name, sv_array.shape); continue
+                    mean_abs_shap = np.mean(np.abs(sv_array), axis=0)
+                    mean_shap = np.mean(sv_array, axis=0) # Mean SHAP value per feature
+                    shap_imp_df = pd.DataFrame({"Gene": sel_features, f"MeanAbsSHAP_{cls_name}": mean_abs_shap, f"MeanSHAP_{cls_name}": mean_shap})
+                    shap_imp_df = shap_imp_df.sort_values(f"MeanAbsSHAP_{cls_name}", ascending=False)
+                    shap_imp_df.to_csv(out / f"shap_importance_{cls_name}.csv", index=False, float_format='%.5g')
 
-                 # --- Generate Standard Plots (Top N overall) ---
-                 std_plot_kwargs = {'shap_values': sv_array, 'features': X_sel_df, 'max_display': cfg.top_genes_plot, 'show': False}
-                 std_title = f"SHAP Class: {cls_name} (Top {cfg.top_genes_plot} Overall)"
-                 try: plt.figure(); shap.summary_plot(**std_plot_kwargs, plot_type="dot"); plt.title(f"{std_title} - Summary"); plt.tight_layout(); plt.savefig(out / f"shap_summary_dot_{cls_name}.png", dpi=150); plt.close()
-                 except Exception as e: LOGGER.error("Failed standard dot plot '%s': %s", cls_name, e)
-                 try: plt.figure(); shap.summary_plot(**std_plot_kwargs, plot_type="bar"); plt.title(f"{std_title} - Global Importance"); plt.tight_layout(); plt.savefig(out / f"shap_summary_bar_{cls_name}.png", dpi=150); plt.close()
-                 except Exception as e: LOGGER.error("Failed standard bar plot '%s': %s", cls_name, e)
+                    # --- Generate Standard Plots (Top N overall) ---
+                    std_plot_kwargs = {'shap_values': sv_array, 'features': X_sel_df, 'max_display': cfg.top_genes_plot, 'show': False}
+                    std_title = f"SHAP Class: {cls_name} (Top {cfg.top_genes_plot} Overall)"
+                    try: plt.figure(); shap.summary_plot(**std_plot_kwargs, plot_type="dot"); plt.title(f"{std_title} - Summary"); plt.tight_layout(); plt.savefig(out / f"shap_summary_dot_{cls_name}.png", dpi=150); plt.close()
+                    except Exception as e: LOGGER.error("Failed standard dot plot '%s': %s", cls_name, e)
+                    try: plt.figure(); shap.summary_plot(**std_plot_kwargs, plot_type="bar"); plt.title(f"{std_title} - Global Importance"); plt.tight_layout(); plt.savefig(out / f"shap_summary_bar_{cls_name}.png", dpi=150); plt.close()
+                    except Exception as e: LOGGER.error("Failed standard bar plot '%s': %s", cls_name, e)
 
-                 # --- Generate Filtered Plots (Top N with Positive Mean SHAP) ---
-                 positive_contrib_df = shap_imp_df[shap_imp_df[f"MeanSHAP_{cls_name}"] > 1e-6].copy() # Filter by positive mean SHAP
-                 n_to_display = min(cfg.top_genes_plot, len(positive_contrib_df)) # How many to show
-                 if n_to_display > 0:
-                     filtered_top_genes_df = positive_contrib_df.head(n_to_display)
-                     filtered_top_genes = filtered_top_genes_df["Gene"].tolist()
-                     filtered_indices = [gene_to_index[gene] for gene in filtered_top_genes]
-                     sv_subset = sv_array[:, filtered_indices]
-                     X_sel_subset = X_sel_df.iloc[:, filtered_indices]
-                     pos_plot_kwargs = {'shap_values': sv_subset, 'features': X_sel_subset, 'feature_names': filtered_top_genes, 'show': False}
-                     pos_title = f"SHAP Class: {cls_name} (Top {n_to_display} Positive Mean Contrib.)"
-                     LOGGER.info(f"Generating filtered plots for top {n_to_display} positive contributors for class '{cls_name}'.")
-                     try: # Filtered Dot plot
-                         plt.figure(); shap.summary_plot(**pos_plot_kwargs, plot_type="dot"); plt.title(f"{pos_title} - Summary"); plt.tight_layout(); plt.savefig(out / f"shap_summary_dot_positive_{cls_name}.png", dpi=150); plt.close()
-                     except Exception as e: LOGGER.error("Failed filtered dot plot '%s': %s", cls_name, e, exc_info=cfg.log_level=="DEBUG")
-                     try: # Filtered Bar plot
-                         plt.figure(); shap.summary_plot(**pos_plot_kwargs, plot_type="bar"); plt.title(f"{pos_title} - Global Importance"); plt.tight_layout(); plt.savefig(out / f"shap_summary_bar_positive_{cls_name}.png", dpi=150); plt.close()
-                     except Exception as e: LOGGER.error("Failed filtered bar plot '%s': %s", cls_name, e, exc_info=cfg.log_level=="DEBUG")
-                 else:
-                      LOGGER.warning(f"No features found with positive mean SHAP contribution for class '{cls_name}'. Skipping positive-only plots.")
+                    # --- Generate Filtered Plots (Top N with Positive Mean SHAP) ---
+                    positive_contrib_df = shap_imp_df[shap_imp_df[f"MeanSHAP_{cls_name}"] > 1e-6].copy() # Filter by positive mean SHAP
+                    n_to_display = min(cfg.top_genes_plot, len(positive_contrib_df)) # How many to show
+                    if n_to_display > 0:
+                           filtered_top_genes_df = positive_contrib_df.head(n_to_display)
+                           filtered_top_genes = filtered_top_genes_df["Gene"].tolist()
+                           filtered_indices = [gene_to_index[gene] for gene in filtered_top_genes if gene in gene_to_index] # Check if gene exists
+                           if len(filtered_indices) != len(filtered_top_genes):
+                               LOGGER.warning("Mismatch finding indices for filtered top genes.")
+                               missing_plot_genes = set(filtered_top_genes) - set(gene_to_index.keys())
+                               LOGGER.warning("Genes missing from index: %s", missing_plot_genes)
+                               # Continue with the indices found
+                           if not filtered_indices:
+                                LOGGER.warning(f"No valid indices found for positive contributors plot for class '{cls_name}'. Skipping.")
+                                continue
 
-                 LOGGER.debug("SHAP outputs processed for class '%s'.", cls_name)
+                           sv_subset = sv_array[:, filtered_indices]
+                           X_sel_subset = X_sel_df.iloc[:, filtered_indices]
+                           # Ensure feature names match the subsetted data
+                           pos_plot_kwargs = {'shap_values': sv_subset, 'features': X_sel_subset, 'feature_names': X_sel_subset.columns.tolist(), 'show': False}
+                           pos_title = f"SHAP Class: {cls_name} (Top {len(filtered_indices)} Positive Mean Contrib.)"
+                           LOGGER.info(f"Generating filtered plots for top {len(filtered_indices)} positive contributors for class '{cls_name}'.")
+                           try: # Filtered Dot plot
+                               plt.figure(); shap.summary_plot(**pos_plot_kwargs, plot_type="dot"); plt.title(f"{pos_title} - Summary"); plt.tight_layout(); plt.savefig(out / f"shap_summary_dot_positive_{cls_name}.png", dpi=150); plt.close()
+                           except Exception as e: LOGGER.error("Failed filtered dot plot '%s': %s", cls_name, e, exc_info=cfg.log_level=="DEBUG")
+                           try: # Filtered Bar plot
+                               plt.figure(); shap.summary_plot(**pos_plot_kwargs, plot_type="bar"); plt.title(f"{pos_title} - Global Importance"); plt.tight_layout(); plt.savefig(out / f"shap_summary_bar_positive_{cls_name}.png", dpi=150); plt.close()
+                           except Exception as e: LOGGER.error("Failed filtered bar plot '%s': %s", cls_name, e, exc_info=cfg.log_level=="DEBUG")
+                    else:
+                           LOGGER.warning(f"No features found with positive mean SHAP contribution for class '{cls_name}'. Skipping positive-only plots.")
+
+                    LOGGER.debug("SHAP outputs processed for class '%s'.", cls_name)
             LOGGER.info("SHAP analysis outputs generated.")
 
         except Exception as e: LOGGER.error("SHAP analysis failed unexpectedly: %s", e, exc_info=True)
@@ -425,9 +493,16 @@ def predict(table: Path, model_dir: Path, out_csv: Optional[Path] = None) -> Non
         sel_feat_pkl, train_feat_pkl = model_dir / "selected_features.pkl", model_dir / "training_features.pkl"
         if not model_pkl.is_file(): raise FileNotFoundError(f"Model file missing: {model_pkl}")
         if not le_pkl.is_file(): raise FileNotFoundError(f"Encoder file missing: {le_pkl}")
-        if sel_feat_pkl.is_file(): features_to_use = joblib.load(sel_feat_pkl); LOGGER.info("Using %d selected features.", len(features_to_use))
-        elif train_feat_pkl.is_file(): features_to_use = joblib.load(train_feat_pkl); LOGGER.warning("Using all %d training features (selection file missing).", len(features_to_use))
-        else: raise FileNotFoundError(f"Feature list file missing in {model_dir}.")
+
+        # Determine which feature list to use
+        if sel_feat_pkl.is_file():
+            features_to_use = joblib.load(sel_feat_pkl)
+            LOGGER.info("Using %d selected features from 'selected_features.pkl'.", len(features_to_use))
+        elif train_feat_pkl.is_file():
+            features_to_use = joblib.load(train_feat_pkl)
+            LOGGER.warning("Using all %d training features from 'training_features.pkl' ('selected_features.pkl' missing).", len(features_to_use))
+        else: raise FileNotFoundError(f"Feature list file ('selected_features.pkl' or 'training_features.pkl') missing in {model_dir}.")
+
         pipe: Pipeline = joblib.load(model_pkl); le: LabelEncoder = joblib.load(le_pkl)
         LOGGER.info(f"Model loaded. Classes: {list(le.classes_)}")
     except Exception as e: LOGGER.error("Error loading model: %s", e, exc_info=True); raise
@@ -446,22 +521,77 @@ def predict(table: Path, model_dir: Path, out_csv: Optional[Path] = None) -> Non
     LOGGER.info("--- Step 3: Aligning Features & Predicting ---")
     try:
         LOGGER.info("Aligning prediction data to %d model features.", len(features_to_use))
+        # Ensure features_to_use is a list of strings
+        if not isinstance(features_to_use, list) or not all(isinstance(f, str) for f in features_to_use):
+             raise TypeError(f"Loaded features ('features_to_use') are not a list of strings. Type: {type(features_to_use)}")
+
+        # Align columns: keep only those in features_to_use, add missing ones with 0
         X_pred_aligned = X_pred_raw.reindex(columns=features_to_use, fill_value=0)
+
         missing = set(features_to_use)-set(X_pred_raw.columns); extra = set(X_pred_raw.columns)-set(features_to_use)
-        if missing: LOGGER.warning("%d expected features missing (added as 0): %s...", len(missing), list(missing)[:3])
-        if extra: LOGGER.info("%d extra features ignored: %s...", len(extra), list(extra)[:3])
-        if X_pred_aligned.shape[1] != len(features_to_use): raise ValueError("Feature alignment failed.")
+        if missing: LOGGER.warning("%d expected features missing in input data (filled with 0): %s...", len(missing), list(missing)[:3])
+        if extra: LOGGER.info("%d features in input data ignored (not used by model): %s...", len(extra), list(extra)[:3])
+        if X_pred_aligned.shape[1] != len(features_to_use):
+             raise ValueError(f"Feature alignment failed. Expected {len(features_to_use)} features, got {X_pred_aligned.shape[1]}.")
+        if not all(X_pred_aligned.columns == features_to_use):
+             LOGGER.warning("Columns after reindexing are not in the exact expected order, but should contain the correct features.")
+             X_pred_aligned = X_pred_aligned[features_to_use] # Enforce order strictly
+
 
         res = pd.DataFrame(); pred_cols_base = ["Sample", "Prediction"]
         pred_cols_proba = [f"Prob_{c}" for c in le.classes_] if hasattr(pipe, "predict_proba") else []
         if not X_pred_aligned.empty:
             LOGGER.info("Predicting classes for %d samples...", X_pred_aligned.shape[0])
-            pred_enc = pipe.predict(X_pred_aligned); pred_labels = le.inverse_transform(pred_enc)
-            res = pd.DataFrame({"Sample": X_pred_aligned.index, "Prediction": pred_labels})
+
+            # Check if the pipeline needs the selected features or all features before prediction
+            # The loaded pipe *should* handle the feature selection internally if it was trained with it.
+            # We provide the data aligned to the features expected *after* selection if 'selected_features.pkl' was used,
+            # or all training features if 'training_features.pkl' was used.
+            # If selected_features.pkl was used, the model expects input matching those selected features.
+            # If training_features.pkl was used, the model expects all original training features and will apply selection internally.
+
+            # MODIFICACIÓN: Determine which data frame to pass to predict based on which feature list was loaded.
+            # The pipeline expects the *input* to the *first* step.
+            # If we loaded 'selected_features.pkl', it means the pipeline saved was likely just the classifier step,
+            # or the selector was applied *before* saving. This is ambiguous.
+            # Safest bet: Re-align the raw prediction data (X_pred_raw) to the *original training* features if available.
+            # If only selected features are available, assume the pipeline expects *only* those.
+
+            data_for_prediction = X_pred_aligned # Default: Assume aligned data is correct input
+
+            # Let's rethink: The pipeline object `pipe` loaded from model.pkl contains *all* steps, including the selector.
+            # Therefore, it always expects the input data to have the *original* features that the *selector* expects.
+            # We need the list of features the pipeline was originally trained on.
+            original_training_features = None
+            if train_feat_pkl.is_file():
+                 original_training_features = joblib.load(train_feat_pkl)
+                 LOGGER.debug("Loaded original training feature list from 'training_features.pkl'.")
+            else:
+                 # If original list is missing, we have a problem if selector is present.
+                 # Fallback: Use features_to_use, assuming pipe might be just the clf.
+                 LOGGER.warning("Original 'training_features.pkl' not found. Using the loaded 'features_to_use' list for prediction alignment. This might fail if the saved pipeline includes a selector step.")
+                 original_training_features = features_to_use # Risky fallback
+
+            if original_training_features:
+                 LOGGER.info("Re-aligning prediction data to %d original training features.", len(original_training_features))
+                 X_pred_realigned_for_pipe = X_pred_raw.reindex(columns=original_training_features, fill_value=0)
+                 if X_pred_realigned_for_pipe.shape[1] != len(original_training_features):
+                      raise ValueError("Re-alignment to original training features failed.")
+                 data_for_prediction = X_pred_realigned_for_pipe
+            else:
+                 # Stick with the previous X_pred_aligned if original features couldn't be loaded
+                 LOGGER.warning("Proceeding with prediction using data aligned to 'features_to_use'.")
+
+
+            # Now predict using the correctly aligned data
+            pred_enc = pipe.predict(data_for_prediction); pred_labels = le.inverse_transform(pred_enc)
+            res = pd.DataFrame({"Sample": data_for_prediction.index, "Prediction": pred_labels})
+
             if pred_cols_proba: # Check if proba is expected
                 try:
-                    proba = pipe.predict_proba(X_pred_aligned)
-                    res = res.join(pd.DataFrame(proba, columns=pred_cols_proba, index=X_pred_aligned.index))
+                    proba = pipe.predict_proba(data_for_prediction)
+                    # Ensure proba aligns with results df index if prediction was successful
+                    res = res.join(pd.DataFrame(proba, columns=pred_cols_proba, index=data_for_prediction.index))
                     LOGGER.info("Probabilities calculated.")
                 except Exception as e: LOGGER.warning("Could not compute probabilities: %s", e); pred_cols_proba = [] # Reset if failed
         else: LOGGER.warning("Prediction data empty after alignment.")
@@ -503,7 +633,7 @@ def _build_cli() -> argparse.ArgumentParser:
     # Predict Sub-parser
     pr = sub.add_parser("predict", help="Predict using trained model", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     pr.add_argument("table", type=Path, help="Input Panaroo TSV to classify")
-    pr.add_argument("model_dir", type=Path, help="Directory with saved model artifacts")
+    pr.add_argument("model_dir", type=Path, help="Directory with saved model artifacts (must contain model.pkl, label_encoder.pkl, and *features.pkl)")
     pr.add_argument("--output", "-o", type=Path, default=None, metavar="FILE.csv", help="Output CSV file path")
     return parser
 
@@ -532,13 +662,35 @@ def main() -> None:
     # --- Execute Predict Command ---
     elif args.cmd == "predict":
         try:
-            model_dir = args.model_dir.resolve(strict=True) # Error if dir not found
-            if not model_dir.is_dir(): raise FileNotFoundError(f"Model directory not found: {model_dir}")
-            table = args.table.resolve(strict=True) # Error if file not found
-            output = args.output.resolve() if args.output else None
+            # Ensure model directory and input table exist before proceeding
+            model_dir = args.model_dir.resolve(strict=True) # Error if dir not found or not accessible
+            if not model_dir.is_dir(): raise NotADirectoryError(f"Model directory path is not a directory: {model_dir}")
+
+            table = args.table.resolve(strict=True) # Error if file not found or not accessible
+            if not table.is_file(): raise FileNotFoundError(f"Input table file not found: {table}")
+
+            # Resolve output path, create parent directory if needed
+            output = None
+            if args.output:
+                output = args.output.resolve()
+                try:
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    logging.getLogger("main").error(f"Could not create output directory {output.parent}: {e}")
+                    sys.exit(1)
+
             predict(table, model_dir, output)
-        except Exception as e: logging.getLogger("main").error("Prediction failed: %s", e, exc_info=True); sys.exit(1)
+        except FileNotFoundError as e:
+             logging.getLogger("main").error(f"Input Error: {e}")
+             sys.exit(1)
+        except NotADirectoryError as e:
+             logging.getLogger("main").error(f"Input Error: {e}")
+             sys.exit(1)
+        except Exception as e:
+            logging.getLogger("main").error("Prediction failed: %s", e, exc_info=True); sys.exit(1)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stderr)
+    # BasicConfig should ideally be called only once. setup_logger handles detailed config later.
+    # Set a default level here in case setup_logger isn't called (e.g., before args parsing).
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stderr)
     main()
